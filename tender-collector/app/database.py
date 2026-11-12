@@ -41,6 +41,69 @@ CREATE TABLE IF NOT EXISTS collection_runs (
     started_at      TEXT NOT NULL,
     finished_at     TEXT NOT NULL
 );
+
+-- --------------------------------------------------------------------------
+-- 双源核对：采集与保存严格按来源隔离（recon_* 与单源 announcements 互不相通）
+-- --------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS recon_announcements (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id       TEXT NOT NULL,
+    code            TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    kind            TEXT NOT NULL CHECK (kind IN ('original', 'correction')),
+    project_name    TEXT NOT NULL,
+    published_at    TEXT NOT NULL,
+    deadline        TEXT,
+    corrects_code   TEXT,
+    detail_url      TEXT NOT NULL,
+    last_seen_at    TEXT NOT NULL,
+    UNIQUE(source_id, code)
+);
+CREATE INDEX IF NOT EXISTS idx_recon_source
+    ON recon_announcements(source_id);
+CREATE INDEX IF NOT EXISTS idx_recon_corrects
+    ON recon_announcements(source_id, corrects_code);
+
+CREATE TABLE IF NOT EXISTS reconciliation_runs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_a_url    TEXT NOT NULL,
+    source_b_url    TEXT NOT NULL,
+    status          TEXT NOT NULL CHECK (status IN ('success', 'failed')),
+    items_a         INTEGER NOT NULL DEFAULT 0,
+    items_b         INTEGER NOT NULL DEFAULT 0,
+    error           TEXT,
+    started_at      TEXT NOT NULL,
+    finished_at     TEXT NOT NULL
+);
+
+-- 一轮成功核对发布一个快照；两侧条目同快照同事务写入，查询永远看到成对结果
+CREATE TABLE IF NOT EXISTS recon_snapshots (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id          INTEGER NOT NULL,
+    created_at      TEXT NOT NULL,
+    source_a_url    TEXT NOT NULL,
+    source_b_url    TEXT NOT NULL,
+    FOREIGN KEY(run_id) REFERENCES reconciliation_runs(id)
+);
+
+CREATE TABLE IF NOT EXISTS recon_snapshot_items (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id     INTEGER NOT NULL,
+    original_code   TEXT NOT NULL,
+    project_name    TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    a_project_name  TEXT,
+    a_deadline      TEXT,
+    a_source_code   TEXT,
+    a_source_url    TEXT,
+    b_project_name  TEXT,
+    b_deadline      TEXT,
+    b_source_code   TEXT,
+    b_source_url    TEXT,
+    FOREIGN KEY(snapshot_id) REFERENCES recon_snapshots(id)
+);
+CREATE INDEX IF NOT EXISTS idx_recon_snapshot_items
+    ON recon_snapshot_items(snapshot_id);
 """
 
 
@@ -129,5 +192,155 @@ def fetch_runs(conn: sqlite3.Connection, limit: int = 20) -> list[sqlite3.Row]:
     return list(
         conn.execute(
             "SELECT * FROM collection_runs ORDER BY id DESC LIMIT ?", (limit,)
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# 双源核对持久化
+# ---------------------------------------------------------------------------
+def replace_recon_announcements(
+    conn: sqlite3.Connection, source_id: str, rows: list[dict[str, Any]]
+) -> None:
+    """整源替换：在调用方事务内先清掉该来源旧数据再写入，天然按来源隔离。"""
+    now = utcnow_iso()
+    conn.execute(
+        "DELETE FROM recon_announcements WHERE source_id = ?", (source_id,)
+    )
+    ordered = sorted(rows, key=lambda r: 0 if r["kind"] == "original" else 1)
+    conn.executemany(
+        """
+        INSERT INTO recon_announcements
+            (source_id, code, title, kind, project_name, published_at, deadline,
+             corrects_code, detail_url, last_seen_at)
+        VALUES
+            (:source_id, :code, :title, :kind, :project_name, :published_at,
+             :deadline, :corrects_code, :detail_url, :last_seen_at)
+        """,
+        [{**r, "source_id": source_id, "last_seen_at": now} for r in ordered],
+    )
+
+
+def fetch_recon_announcements(
+    conn: sqlite3.Connection, source_id: str
+) -> list[sqlite3.Row]:
+    return list(
+        conn.execute(
+            """
+            SELECT code, title, kind, project_name, published_at, deadline,
+                   corrects_code, detail_url
+            FROM recon_announcements
+            WHERE source_id = ?
+            ORDER BY project_name, published_at, code
+            """,
+            (source_id,),
+        )
+    )
+
+
+def record_reconciliation_run(
+    conn: sqlite3.Connection,
+    *,
+    source_a_url: str,
+    source_b_url: str,
+    status: str,
+    items_a: int,
+    items_b: int,
+    error: str | None,
+    started_at: str,
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO reconciliation_runs
+            (source_a_url, source_b_url, status, items_a, items_b,
+             error, started_at, finished_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            source_a_url,
+            source_b_url,
+            status,
+            items_a,
+            items_b,
+            error,
+            started_at,
+            utcnow_iso(),
+        ),
+    )
+    return int(cur.lastrowid)
+
+
+def insert_recon_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    run_id: int,
+    source_a_url: str,
+    source_b_url: str,
+    items: list[dict[str, Any]],
+) -> int:
+    """在调用方事务内写入快照头与全部条目；失败回滚则整条快照不可见。"""
+    cur = conn.execute(
+        """
+        INSERT INTO recon_snapshots (run_id, created_at, source_a_url, source_b_url)
+        VALUES (?, ?, ?, ?)
+        """,
+        (run_id, utcnow_iso(), source_a_url, source_b_url),
+    )
+    snapshot_id = int(cur.lastrowid)
+    conn.executemany(
+        """
+        INSERT INTO recon_snapshot_items
+            (snapshot_id, original_code, project_name, status,
+             a_project_name, a_deadline, a_source_code, a_source_url,
+             b_project_name, b_deadline, b_source_code, b_source_url)
+        VALUES
+            (:snapshot_id, :original_code, :project_name, :status,
+             :a_project_name, :a_deadline, :a_source_code, :a_source_url,
+             :b_project_name, :b_deadline, :b_source_code, :b_source_url)
+        """,
+        [
+            {
+                "snapshot_id": snapshot_id,
+                "original_code": item["original_code"],
+                "project_name": item["project_name"],
+                "status": item["status"],
+                "a_project_name": item["a_project_name"],
+                "a_deadline": item["a_deadline"],
+                "a_source_code": item["a_source_code"],
+                "a_source_url": item["a_source_url"],
+                "b_project_name": item["b_project_name"],
+                "b_deadline": item["b_deadline"],
+                "b_source_code": item["b_source_code"],
+                "b_source_url": item["b_source_url"],
+            }
+            for item in items
+        ],
+    )
+    return snapshot_id
+
+
+def fetch_latest_snapshot(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM recon_snapshots ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+
+
+def fetch_snapshot_items(
+    conn: sqlite3.Connection, snapshot_id: int
+) -> list[sqlite3.Row]:
+    return list(
+        conn.execute(
+            "SELECT * FROM recon_snapshot_items WHERE snapshot_id = ? ORDER BY id",
+            (snapshot_id,),
+        )
+    )
+
+
+def fetch_reconciliation_runs(
+    conn: sqlite3.Connection, limit: int = 20
+) -> list[sqlite3.Row]:
+    return list(
+        conn.execute(
+            "SELECT * FROM reconciliation_runs ORDER BY id DESC LIMIT ?", (limit,)
         )
     )

@@ -21,5 +21,25 @@ services:
       - ./demo_site:/usr/share/nginx/html:ro
     restart: unless-stopped
 
+  # 双源核对的第二个公告来源：含截止时间冲突与单边刊载示例
+  demo-site-b:
+    image: nginx:1.27-alpine
+    container_name: tender-demo-site-b
+    ports:
+      - "8002:80"
+    volumes:
+      - ./demo_site_b:/usr/share/nginx/html:ro
+    restart: unless-stopped
+
+  # 页面故障示例：列表页指向不存在的详情页（HTTP 404）
+  demo-site-broken:
+    image: nginx:1.27-alpine
+    container_name: tender-demo-site-broken
+    ports:
+      - "8003:80"
+    volumes:
+      - ./demo_site_broken:/usr/share/nginx/html:ro
+    restart: unless-stopped
+
 volumes:
   tender-data:

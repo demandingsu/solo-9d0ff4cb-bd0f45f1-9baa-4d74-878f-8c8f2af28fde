@@ -20,6 +20,7 @@ class MergeError(ValueError):
 @dataclass(frozen=True)
 class EffectiveDeadline:
     project_name: str
+    original_code: str
     deadline: str
     source_code: str
     source_url: str
@@ -70,6 +71,7 @@ def merge_projects(rows: Iterable[dict[str, Any]]) -> list[EffectiveDeadline]:
         results.append(
             EffectiveDeadline(
                 project_name=project_name,
+                original_code=code,
                 deadline=source["deadline"],
                 source_code=source["code"],
                 source_url=source["detail_url"],

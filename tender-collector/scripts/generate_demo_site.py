@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
-"""生成一个本地分页 HTML 示例公告站（市政工程招投标公告）。
+"""生成本地静态 HTML 示例公告站，供离线演示采集与双源核对。
 
-生成结果写入 demo_site/，纯静态文件，可用任意 HTTP 服务器托管：
-    python3 -m http.server 8001 --directory demo_site
+生成三个站点（均为纯静态文件，可用任意 HTTP 服务器托管）：
+
+1. demo_site/         来源 A：5 个项目、10 条公告（单源采集的原始示例站）；
+2. demo_site_b/       来源 B：同一批市政项目的另一刊载来源，与来源 A 存在
+                       截止时间冲突、单边刊载等分歧；
+3. demo_site_broken/  页面故障示例：列表页指向一个不存在的详情页（HTTP 404），
+                       用于演示双源核对失败时保留上一轮成对快照。
 
 数据特意构造为：
 - 列表页按发布时间倒序排列（更正公告排在其引用的原公告之前），
   服务端不能依赖页面顺序来判断截止时间；
 - 每个项目的“生效截止时间”由发布时间最新的那份公告（原公告或更正公告）决定；
-- 含已过期与未过期两种项目。
+- 来源 A/B 的同一原公告编号内容可以不同，采集与保存按来源隔离。
 """
 from __future__ import annotations
 
 import html
-import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 PAGE_SIZE = 4
-OUT_DIR = Path(__file__).resolve().parent.parent / "demo_site"
+ROOT_DIR = Path(__file__).resolve().parent.parent
+OUT_DIR = ROOT_DIR / "demo_site"
+OUT_DIR_B = ROOT_DIR / "demo_site_b"
+OUT_DIR_BROKEN = ROOT_DIR / "demo_site_broken"
 
 
 @dataclass
@@ -38,7 +45,7 @@ class Announcement:
 
 
 # ---------------------------------------------------------------------------
-# 示例数据：5 个项目，其中 3 个含更正公告，共 10 条公告
+# 来源 A 示例数据：5 个项目，其中 3 个含更正公告，共 10 条公告
 # ---------------------------------------------------------------------------
 ANNOUNCEMENTS: list[Announcement] = [
     # 项目 A：原公告已过期，更正延期后仍在有效期内
@@ -138,8 +145,102 @@ ANNOUNCEMENTS: list[Announcement] = [
     ),
 ]
 
+# ---------------------------------------------------------------------------
+# 来源 B 示例数据：另一公告平台对同一批项目的刊载
+# - 001：截止时间与来源 A 冲突（26 日 09:00 vs 25 日 14:30）
+# - 002：两次更正后最终截止时间与来源 A 一致（11-30 10:00）
+# - 004：原公告截止时间与来源 A 不同，更正公告不改时间，仍构成冲突
+# - 006：仅来源 B 刊载的项目（来源 A 没有）
+# - 003、005：来源 B 未刊载（仅来源 A 刊载）
+# ---------------------------------------------------------------------------
+ANNOUNCEMENTS_B: list[Announcement] = [
+    Announcement(
+        code="SZ-2026-001",
+        title="滨河路市政改造工程施工招标公告（公共资源交易平台转载）",
+        kind="original",
+        project_name="滨河路市政改造工程",
+        published_at="2026-10-20 09:30",
+        deadline="2026-11-05 14:30",
+    ),
+    Announcement(
+        code="SZ-2026-001-G1",
+        title="滨河路市政改造工程施工招标更正公告（第一次）",
+        kind="correction",
+        project_name="滨河路市政改造工程",
+        published_at="2026-10-29 10:00",
+        deadline="2026-11-26 09:00",  # 与来源 A 的 2026-11-25 14:30 冲突
+        corrects_code="SZ-2026-001",
+        reason="平台同步的更正公告，截止时间以本平台刊载为准。",
+    ),
+    Announcement(
+        code="SZ-2026-002",
+        title="城北污水处理厂扩建工程招标公告（公共资源交易平台转载）",
+        kind="original",
+        project_name="城北污水处理厂扩建工程",
+        published_at="2026-10-12 11:00",
+        deadline="2026-11-12 09:00",
+    ),
+    Announcement(
+        code="SZ-2026-002-G1",
+        title="城北污水处理厂扩建工程招标更正公告",
+        kind="correction",
+        project_name="城北污水处理厂扩建工程",
+        published_at="2026-10-23 10:00",
+        deadline="2026-11-20 09:00",
+        corrects_code="SZ-2026-002",
+        reason="答疑澄清，截止时间调整。",
+    ),
+    Announcement(
+        code="SZ-2026-002-G2",
+        title="城北污水处理厂扩建工程招标更正公告（第二次）",
+        kind="correction",
+        project_name="城北污水处理厂扩建工程",
+        published_at="2026-11-03 14:00",
+        deadline="2026-11-30 10:00",  # 与来源 A 最终一致
+        corrects_code="SZ-2026-002",
+        reason="再次延期，以本公告时间为准。",
+    ),
+    Announcement(
+        code="SZ-2026-004",
+        title="高新区雨污分流管网工程招标公告（公共资源交易平台转载）",
+        kind="original",
+        project_name="高新区雨污分流管网工程",
+        published_at="2026-10-25 15:00",
+        deadline="2026-11-29 16:00",  # 与来源 A 的 2026-11-28 09:30 冲突
+    ),
+    Announcement(
+        code="SZ-2026-004-G1",
+        title="高新区雨污分流管网工程招标更正公告",
+        kind="correction",
+        project_name="高新区雨污分流管网工程",
+        published_at="2026-11-01 10:30",
+        deadline=None,  # 不改截止时间，沿用来源 B 原公告时间
+        corrects_code="SZ-2026-004",
+        reason="仅更正联系人电话，投标截止时间不变。",
+    ),
+    # 仅来源 B 刊载：来源 A 完全没有 SZ-2026-006
+    Announcement(
+        code="SZ-2026-006",
+        title="沿江景观带提升工程招标公告",
+        kind="original",
+        project_name="沿江景观带提升工程",
+        published_at="2026-10-18 09:00",
+        deadline="2026-12-15 09:00",
+    ),
+    Announcement(
+        code="SZ-2026-006-G1",
+        title="沿江景观带提升工程招标更正公告",
+        kind="correction",
+        project_name="沿江景观带提升工程",
+        published_at="2026-11-04 16:20",
+        deadline="2026-12-20 10:00",
+        corrects_code="SZ-2026-006",
+        reason="设计方案优化，开标顺延。",
+    ),
+]
 
-def _detail_page(a: Announcement) -> str:
+
+def render_detail_page(a: Announcement) -> str:
     rows = [
         ("公告编号", a.code),
         ("公告类型", "更正公告" if a.kind == "correction" else "招标公告"),
@@ -179,7 +280,9 @@ def _detail_page(a: Announcement) -> str:
 """
 
 
-def _list_page(items: list[Announcement], page: int, total_pages: int) -> str:
+def render_list_page(
+    items: list[Announcement], page: int, total_pages: int
+) -> str:
     lis = []
     for a in items:
         lis.append(
@@ -219,28 +322,72 @@ def _list_page(items: list[Announcement], page: int, total_pages: int) -> str:
 """
 
 
-def main() -> None:
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    # 列表按发布时间倒序 —— 更正公告天然排在原公告前面，制造页面顺序干扰
-    ordered = sorted(ANNOUNCEMENTS, key=lambda a: a.published_at, reverse=True)
-    total_pages = (len(ordered) + PAGE_SIZE - 1) // PAGE_SIZE
-
-    for a in ordered:
-        (OUT_DIR / a.filename).write_text(_detail_page(a), encoding="utf-8")
-
-    for page in range(1, total_pages + 1):
-        chunk = ordered[(page - 1) * PAGE_SIZE: page * PAGE_SIZE]
-        (OUT_DIR / f"list_{page}.html").write_text(
-            _list_page(chunk, page, total_pages), encoding="utf-8"
-        )
-
-    (OUT_DIR / "index.html").write_text(
+def _index_page() -> str:
+    return (
         '<!DOCTYPE html><html><head><meta charset="utf-8">'
         '<meta http-equiv="refresh" content="0; url=list_1.html">'
-        "<title>公告站</title></head><body>跳转中…</body></html>\n",
-        encoding="utf-8",
+        "<title>公告站</title></head><body>跳转中…</body></html>\n"
     )
-    print(f"generated {len(ordered)} detail pages, {total_pages} list pages in {OUT_DIR}")
+
+
+def write_site(
+    out_dir: Path, announcements: list[Announcement], page_size: int = PAGE_SIZE
+) -> None:
+    """把一组公告渲染为完整的分页静态站点。"""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # 列表按发布时间倒序 —— 更正公告天然排在原公告前面，制造页面顺序干扰
+    ordered = sorted(announcements, key=lambda a: a.published_at, reverse=True)
+    total_pages = (len(ordered) + page_size - 1) // page_size
+
+    for a in ordered:
+        (out_dir / a.filename).write_text(render_detail_page(a), encoding="utf-8")
+
+    for page in range(1, total_pages + 1):
+        chunk = ordered[(page - 1) * page_size: page * page_size]
+        (out_dir / f"list_{page}.html").write_text(
+            render_list_page(chunk, page, total_pages), encoding="utf-8"
+        )
+
+    (out_dir / "index.html").write_text(_index_page(), encoding="utf-8")
+    print(
+        f"generated {len(ordered)} detail pages, {total_pages} list pages "
+        f"in {out_dir}"
+    )
+
+
+def write_broken_site(out_dir: Path) -> None:
+    """故障站点：列表页解析正常，但指向的详情页不存在（抓取详情时 HTTP 404）。"""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    list_html = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>市政工程公告站（故障示例）</title>
+</head>
+<body>
+  <h1>市政工程招投标公告列表（第 1/1 页）</h1>
+  <ul class="announcement-list" data-page="1">
+    <li class="announcement-item" data-code="SZ-2026-001">
+      <a class="detail-link" href="missing-detail-404.html">滨河路市政改造工程施工招标公告</a>
+      <span class="published-at">2026-10-20 09:00</span>
+    </li>
+  </ul>
+  <nav class="pagination">
+    <span class="page-current">1</span>
+    <span class="page-next-disabled">下一页</span>
+  </nav>
+</body>
+</html>
+"""
+    (out_dir / "list_1.html").write_text(list_html, encoding="utf-8")
+    (out_dir / "index.html").write_text(_index_page(), encoding="utf-8")
+    print(f"generated broken demo site (missing detail page) in {out_dir}")
+
+
+def main() -> None:
+    write_site(OUT_DIR, ANNOUNCEMENTS)
+    write_site(OUT_DIR_B, ANNOUNCEMENTS_B)
+    write_broken_site(OUT_DIR_BROKEN)
 
 
 if __name__ == "__main__":
